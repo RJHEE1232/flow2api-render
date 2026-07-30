@@ -2,7 +2,32 @@
 set -euo pipefail
 cd /app
 
+# Install shim into THIS process tree's python path permanently via sitecustomize-like file
 python /app/curl_cffi_shim.py || true
+# Persist shim for child imports: write a tiny bootstrap module import path
+python - <<'PY'
+import sys
+from pathlib import Path
+# Ensure shim runs as early import hook for subsequent python -c / uvicorn workers
+sitecustomize = Path("/usr/local/lib/python3.11/site-packages/sitecustomize.py")
+hook = '''
+try:
+    import curl_cffi  # noqa: F401
+except Exception:
+    try:
+        import runpy
+        runpy.run_path("/app/curl_cffi_shim.py", run_name="__main__")
+    except Exception as e:
+        print("[sitecustomize] curl_cffi shim failed:", e)
+'''
+# append once
+text = sitecustomize.read_text(encoding="utf-8") if sitecustomize.exists() else ""
+if "curl_cffi_shim" not in text and "curl_cffi shim" not in text:
+    sitecustomize.write_text(text + "\n" + hook, encoding="utf-8")
+    print("[render-entrypoint] sitecustomize hook installed")
+else:
+    print("[render-entrypoint] sitecustomize hook already present")
+PY
 
 python - <<'PY'
 from pathlib import Path
@@ -98,13 +123,23 @@ capsolver_base_url = "https://api.capsolver.com"
 """
 Path("config").mkdir(parents=True, exist_ok=True)
 Path("config/setting.toml").write_text(text.strip() + "\n", encoding="utf-8")
-# validate
 import tomli
 tomli.loads(text)
 print(f"[render-entrypoint] port={port} captcha={captcha} proxy={bool(proxy_url)}")
 PY
 
+# re-apply shim in case sitecustomize path differs
+python /app/curl_cffi_shim.py || true
+
 exec python - <<'PY'
+# force shim before app import
+import runpy
+try:
+    from curl_cffi.requests import AsyncSession  # noqa: F401
+except Exception:
+    runpy.run_path("/app/curl_cffi_shim.py", run_name="__main__")
+    from curl_cffi.requests import AsyncSession  # noqa: F401
+
 from src.core.config import config
 import uvicorn
 uvicorn.run("src.main:app", host=config.server_host, port=config.server_port, reload=False)
